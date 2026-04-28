@@ -38,9 +38,6 @@ def generate_launch_description():
 
     # --- Launch Configurations ---
     ld = LaunchDescription()
-    stop_distance = LaunchConfiguration("stop_distance", default="0.45")
-    goal_x = LaunchConfiguration("goal_x", default="2.0")
-    goal_y = LaunchConfiguration("goal_y", default="1.0")
     use_sim_time = LaunchConfiguration("use_sim_time", default="True")
     enable_rviz = LaunchConfiguration("enable_rviz", default="True")
     rviz_config_file = LaunchConfiguration(
@@ -75,23 +72,6 @@ def generate_launch_description():
     declare_headless_cmd = DeclareLaunchArgument(
         "headless", default_value="False", description="Whether to execute gzclient)"
     )
-    declare_stop_distance_arg = DeclareLaunchArgument(
-    "stop_distance",
-        default_value="0.45",
-        description="Obstacle stop distance",
-    )
-
-    declare_goal_x_arg = DeclareLaunchArgument(
-        "goal_x",
-        default_value="2.0",
-        description="Goal x position",
-    )
-
-    declare_goal_y_arg = DeclareLaunchArgument(
-        "goal_y",
-        default_value="1.0",
-        description="Goal y position",
-    )
     # --- Nodes and Launch Includes ---
     # Gazebo
     start_gazebo_server_cmd = IncludeLaunchDescription(
@@ -113,12 +93,7 @@ def generate_launch_description():
     start_obstacle_det_cmd = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(obstacle_dir, "launch", "obstacle_detection.launch.py")
-        ),
-        launch_arguments = {
-            "stop_distance": stop_distance,
-            "goal_x": goal_x,
-            "goal_y": goal_y,
-        }.items(),
+        )
     )
 
     # Common Remappings
@@ -269,7 +244,7 @@ def generate_launch_description():
 
     ld.add_action(start_gazebo_server_cmd)
     ld.add_action(start_gazebo_client_cmd)
-    #ld.add_action(start_obstacle_det_cmd)
+    ld.add_action(start_obstacle_det_cmd)
 
     ld.add_action(map_server_node)
     ld.add_action(map_server_lifecycle_node)
