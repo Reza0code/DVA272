@@ -176,7 +176,7 @@ class ObstacleDetection(Node):
             angle = self.normalize_angle(angle)
 
             # Framför roboten: ungefär -45 till +45 grader
-            if -0.55 <= angle <= 0.55:
+            if -0.8 <= angle <= 0.8:
                 if r < closest_distance:
                     closest_distance = r
                     closest_angle = angle
@@ -284,7 +284,7 @@ class ObstacleDetection(Node):
                 return
 
             # P-regulator mot mål
-            P = 0.8
+            P = 0.6
             max_angular_speed = 0.30
 
             twist.angular.z = P * e_theta_goal
