@@ -19,6 +19,7 @@ ament_python_install_package(${PROJECT_NAME})
 # Install Python executables
 install(PROGRAMS
   ${PROJECT_NAME}/obstacle_detection.py
+  ${PROJECT_NAME}/obstacle_detection_del23.py
   ${PROJECT_NAME}/lidar_visualizer.py
   DESTINATION lib/${PROJECT_NAME}
 )
