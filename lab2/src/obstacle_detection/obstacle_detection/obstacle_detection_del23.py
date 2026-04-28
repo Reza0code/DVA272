@@ -21,7 +21,7 @@ class ObstacleDetection(Node):
         # -----------------------------
         # Parametrar
         # -----------------------------
-        self.declare_parameter("stop_distance", 0.45)
+        self.declare_parameter("stop_distance", 0.25)
         self.declare_parameter("goal_x", 2.0)
         self.declare_parameter("goal_y", 1.0)
 
@@ -176,7 +176,7 @@ class ObstacleDetection(Node):
             angle = self.normalize_angle(angle)
 
             # Framför roboten: ungefär -45 till +45 grader
-            if -0.8 <= angle <= 0.8:
+            if -0.55 <= angle <= 0.55:
                 if r < closest_distance:
                     closest_distance = r
                     closest_angle = angle
@@ -210,11 +210,10 @@ class ObstacleDetection(Node):
     # --------------------------------------------------
     def choose_avoid_direction(self, closest_angle, goal_angle):
         # Kolla vilken sida som är mest fri
-       if closest_angle > 0:
-           return -1.0
-       else:
-           return 1.0
-
+        if closest_angle > 0:
+            return -1.0
+        else:
+            return 1.0
     # --------------------------------------------------
     # Huvudlogik
     # --------------------------------------------------
@@ -284,7 +283,7 @@ class ObstacleDetection(Node):
                 return
 
             # P-regulator mot mål
-            P = 0.6
+            P = 0.8
             max_angular_speed = 0.30
 
             twist.angular.z = P * e_theta_goal
@@ -337,7 +336,7 @@ class ObstacleDetection(Node):
             # Kolla om det är fritt rakt framför
             front_clearance = self.get_sector_distance(-0.35, 0.35)
 
-            if front_clearance < self.stop_distance + 0.15:
+            if front_clearance < self.stop_distance + 0.10:
                 self.mode = "AVOID_TURN"
                 self.avoid_target_yaw = self.normalize_angle(
                     self.yaw + self.avoid_direction * math.pi / 4
@@ -362,7 +361,7 @@ class ObstacleDetection(Node):
             twist.angular.z = max(min(twist.angular.z, 0.20), -0.20)
 
             # Om något fortfarande är rakt framför: sväng lite mer
-            if closest_distance < self.stop_distance and abs(closest_angle) < 0.45:
+            if closest_distance < self.stop_distance and abs(closest_angle) < 0.35:
                 self.mode = "AVOID_TURN"
                 self.avoid_target_yaw = self.normalize_angle(
                     self.yaw + self.avoid_direction * math.pi / 4
