@@ -15,10 +15,12 @@ from tf_transformations import euler_from_quaternion
 class ObstacleDetection(Node):
     def __init__(self):
         super().__init__("obstacle_detection")
-        self.get_logger().info("JAG KÖR DEL 2.2 GO_TO_GOAL + AVOID")
+        self.get_logger().info("JAG KÖR DEL 2.3 MJUKARE VÄJNING MED VIKTNING")
 
+        # -----------------------------
         # Parametrar
-        self.declare_parameter("stop_distance", 0.45)
+        # -----------------------------
+        self.declare_parameter("stop_distance", 0.30)
         self.declare_parameter("goal_x", 2.0)
         self.declare_parameter("goal_y", 0.0)
 
@@ -43,12 +45,16 @@ class ObstacleDetection(Node):
         self.get_logger().info(f"Using stop_distance: {self.stop_distance}")
         self.get_logger().info(f"Goal: x={self.goal_x}, y={self.goal_y}")
 
+        # -----------------------------
         # Robot state
+        # -----------------------------
         self.pose = Pose()
         self.yaw = 0.0
         self.has_odom_received = False
 
+        # -----------------------------
         # Laser state
+        # -----------------------------
         self.scan_ranges = []
         self.angle_min = 0.0
         self.angle_increment = 0.0
@@ -56,13 +62,11 @@ class ObstacleDetection(Node):
         self.range_max = 3.5
         self.has_scan_received = False
 
+        # -----------------------------
         # Control state
+        # -----------------------------
         self.goal_reached = False
-        self.mode = "GO_TO_GOAL"
         self.avoid_direction = 1.0
-        self.avoid_target_yaw = 0.0
-        self.avoid_turn_start = None
-        self.avoid_forward_start = None
 
         qos = QoSProfile(depth=10)
 
@@ -84,6 +88,9 @@ class ObstacleDetection(Node):
 
         self.timer = self.create_timer(0.1, self.timer_callback)
 
+    # --------------------------------------------------
+    # Odometry
+    # --------------------------------------------------
     def get_odom_callback(self, msg):
         self.pose = msg.pose.pose
 
@@ -98,6 +105,9 @@ class ObstacleDetection(Node):
         self.yaw = yaw
         self.has_odom_received = True
 
+    # --------------------------------------------------
+    # LaserScan
+    # --------------------------------------------------
     def scan_callback(self, msg):
         self.scan_ranges = msg.ranges
         self.angle_min = msg.angle_min
@@ -106,10 +116,16 @@ class ObstacleDetection(Node):
         self.range_max = msg.range_max
         self.has_scan_received = True
 
+    # --------------------------------------------------
+    # Timer
+    # --------------------------------------------------
     def timer_callback(self):
         if self.has_scan_received and self.has_odom_received:
             self.control_robot()
 
+    # --------------------------------------------------
+    # Hjälpfunktioner
+    # --------------------------------------------------
     def normalize_angle(self, angle):
         return math.atan2(math.sin(angle), math.cos(angle))
 
@@ -119,6 +135,9 @@ class ObstacleDetection(Node):
         twist.angular.z = 0.0
         self.cmd_vel_pub.publish(twist)
 
+    # --------------------------------------------------
+    # Hitta närmaste hinder framför roboten
+    # --------------------------------------------------
     def get_front_obstacle(self):
         closest_distance = float("inf")
         closest_angle = 0.0
@@ -133,14 +152,18 @@ class ObstacleDetection(Node):
             angle = self.angle_min + i * self.angle_increment
             angle = self.normalize_angle(angle)
 
-            # Kolla bara framför roboten, ungefär +-90 grader
-            if -0.8 <= angle <= 8.0:
+            # Framför roboten: ungefär +-45 grader
+            # Viktigt: normalisering gör att höger sida inte blir blind.
+            if -0.8 <= angle <= 0.8:
                 if r < closest_distance:
                     closest_distance = r
                     closest_angle = angle
 
         return closest_distance, closest_angle
 
+    # --------------------------------------------------
+    # Hitta närmaste hinder i en sektor
+    # --------------------------------------------------
     def get_sector_distance(self, min_angle, max_angle):
         closest_distance = float("inf")
 
@@ -160,14 +183,19 @@ class ObstacleDetection(Node):
 
         return closest_distance
 
+    # --------------------------------------------------
+    # Välj väjningsriktning
+    # --------------------------------------------------
     def choose_avoid_direction(self, closest_angle):
-        # Om hindret är på vänster sida, sväng höger.
-        # Om hindret är på höger sida, sväng vänster.
-        if closest_angle > 0:
-            return -1.0
-        else:
-            return 1.0
+        if closest_angle > 0.15:
+            self.last_avoid_direction = -1.0   # hinder vänster → sväng höger
+        elif closest_angle < -0.15:
+            self.last_avoid_direction = 1.0    # hinder höger → sväng vänster
 
+        return self.last_avoid_direction
+    # --------------------------------------------------
+    # Huvudlogik: Del 2.3 viktad styrning
+    # --------------------------------------------------
     def control_robot(self):
         twist = Twist()
 
@@ -175,9 +203,14 @@ class ObstacleDetection(Node):
             self.stop_robot()
             return
 
-        robot_x = self.pose.position.x
-        robot_y = self.pose.position.y
+        # -----------------------------
+        # Position och mål
+        # -----------------------------
+        spawn_x = -1.5
+        spawn_y = -0.4
 
+        robot_x = self.pose.position.x + spawn_x
+        robot_y = self.pose.position.y + spawn_y
         dx = self.goal_x - robot_x
         dy = self.goal_y - robot_y
 
@@ -185,108 +218,97 @@ class ObstacleDetection(Node):
         goal_angle = math.atan2(dy, dx)
         e_theta_goal = self.normalize_angle(goal_angle - self.yaw)
 
-        self.get_logger().info(
-            f"Mode={self.mode}, pos=({robot_x:.2f},{robot_y:.2f}), "
-            f"goal_dist={distance_to_goal:.2f}, e_theta={e_theta_goal:.2f}"
-        )
-
+        # -----------------------------
+        # Mål nått
+        # -----------------------------
         if distance_to_goal < 0.25:
             self.goal_reached = True
             self.stop_robot()
             self.get_logger().info("Goal reached! Robot stopped.")
             return
 
+        # -----------------------------
+        # Hinder framför roboten
+        # -----------------------------
         closest_distance, closest_angle = self.get_front_obstacle()
 
-        # -------------------------
-        # GO TO GOAL
-        # -------------------------
-        if self.mode == "GO_TO_GOAL":
-            if closest_distance < self.stop_distance:
-                self.avoid_direction = self.choose_avoid_direction(closest_angle)
+        # -----------------------------
+        # Del 2.3: viktning
+        # -----------------------------
+        avoid_start_distance = self.stop_distance + 0.4
 
-                self.avoid_target_yaw = self.normalize_angle(
-                    self.yaw + self.avoid_direction * math.pi / 3
-                )
+        if closest_distance == float("inf"):
+            avoid_weight = 0.0
+        elif closest_distance <= self.stop_distance:
+            avoid_weight = 1.0
+        elif closest_distance >= avoid_start_distance:
+            avoid_weight = 0.0
+        else:
+            avoid_weight = (avoid_start_distance - closest_distance) / (
+                avoid_start_distance - self.stop_distance
+            )
 
-                self.mode = "AVOID_TURN"
-                self.avoid_turn_start = self.get_clock().now()
+        goal_weight = 1.0 - avoid_weight
 
-                self.get_logger().info(
-                    f"Obstacle detected: {closest_distance:.2f} m. "
-                    f"Switch to AVOID_TURN."
-                )
+        # -----------------------------
+        # Riktning bort från hinder
+        # -----------------------------
+        if avoid_weight > 0.0:
+            self.avoid_direction = self.choose_avoid_direction(closest_angle)
 
-                self.stop_robot()
-                return
+            avoid_angle = self.normalize_angle(
+                self.yaw + self.avoid_direction * math.pi / 3
+            )
 
-            P = 0.6
-            twist.angular.z = P * e_theta_goal
-            twist.angular.z = max(min(twist.angular.z, 0.35), -0.35)
+            e_theta_avoid = self.normalize_angle(avoid_angle - self.yaw)
+        else:
+            e_theta_avoid = 0.0
 
-            # Om vinkelfelet är stort: stå still och rotera först
-            if abs(e_theta_goal) > 0.85:
-                twist.linear.x = 0.0
-            elif abs(e_theta_goal) > 0.45:
-                twist.linear.x = 0.04
+        # -----------------------------
+        # Kombinera mål och väjning
+        # -----------------------------
+        combined_error = (
+            goal_weight * e_theta_goal
+            + avoid_weight * e_theta_avoid
+        )
+
+        combined_error = self.normalize_angle(combined_error)
+
+        # -----------------------------
+        # P-regulator
+        # -----------------------------
+        P = 0.6
+        twist.angular.z = P * combined_error
+        twist.angular.z = max(min(twist.angular.z, 0.35), -0.35)
+
+        # -----------------------------
+        # Framåthastighet
+        # -----------------------------
+        if abs(combined_error) > 0.85:
+            twist.linear.x = 0.0
+        elif abs(combined_error) > 0.45:
+            twist.linear.x = 0.04
+        else:
+            if avoid_weight > 0.6:
+                twist.linear.x = 0.035
+            elif avoid_weight > 0.3:
+                twist.linear.x = 0.06
             else:
                 twist.linear.x = 0.10
 
-            self.cmd_vel_pub.publish(twist)
-            return
+        self.get_logger().info(
+            f"2.3 weights: goal={goal_weight:.2f}, "
+            f"avoid={avoid_weight:.2f}, "
+            f"combined_error={combined_error:.2f}, "
+            f"obstacle={closest_distance:.2f}, "
+            f"goal_dist={distance_to_goal:.2f}"
+        )
 
-        # -------------------------
-        # AVOID TURN
-        # -------------------------
-        if self.mode == "AVOID_TURN":
-            e_theta_avoid = self.normalize_angle(self.avoid_target_yaw - self.yaw)
+        self.cmd_vel_pub.publish(twist)
 
-            twist.linear.x = 0.0
-            twist.angular.z = 0.9 * e_theta_avoid
-            twist.angular.z = max(min(twist.angular.z, 0.5), -0.5)
-
-            now = self.get_clock().now()
-            elapsed = (now - self.avoid_turn_start).nanoseconds / 1e9
-
-            if abs(e_theta_avoid) < 0.15 or elapsed > 2.0:
-                self.mode = "AVOID_FORWARD"
-                self.avoid_forward_start = self.get_clock().now()
-                twist.angular.z = 0.0
-
-                self.get_logger().info("Finished turning. Switch to AVOID_FORWARD.")
-
-            self.cmd_vel_pub.publish(twist)
-            return
-
-        # -------------------------
-        # AVOID FORWARD
-        # -------------------------
-        if self.mode == "AVOID_FORWARD":
-            now = self.get_clock().now()
-            elapsed = (now - self.avoid_forward_start).nanoseconds / 1e9
-
-            front_clearance = self.get_sector_distance(-0.35, 0.35)
-
-            if front_clearance < self.stop_distance:
-                self.mode = "AVOID_TURN"
-                self.avoid_target_yaw = self.normalize_angle(
-                    self.yaw + self.avoid_direction * math.pi / 4
-                )
-                self.avoid_turn_start = self.get_clock().now()
-                self.stop_robot()
-                return
-
-            twist.linear.x = 0.08
-            twist.angular.z = 0.05 * e_theta_goal
-            twist.angular.z = max(min(twist.angular.z, 0.15), -0.15)
-
-            if elapsed > 2.0:
-                self.mode = "GO_TO_GOAL"
-                self.get_logger().info("Back to GO_TO_GOAL.")
-
-            self.cmd_vel_pub.publish(twist)
-            return
-
+    # --------------------------------------------------
+    # Stoppa roboten vid avstängning
+    # --------------------------------------------------
     def destroy_node(self):
         self.get_logger().info("Shutting down, stopping robot...")
         self.stop_robot()
