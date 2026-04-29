@@ -25,7 +25,7 @@ class LidarVisualizer(Node):
         self.stop_distance = self.get_parameter("stop_distance").get_parameter_value().double_value
         
         # Visualization properties
-        self.declare_parameter("range_multiplier", 1.5)
+        self.declare_parameter("range_multiplier", 1.0)
         multiplier = self.get_parameter("range_multiplier").get_parameter_value().double_value
         
         # Show max distance as a multiple of stop_distance
@@ -213,6 +213,7 @@ class LidarVisualizer(Node):
         # 360 degrees total
         angle_range = 2 * math.pi
         
+
         for i in range(num_points + 1):
             angle = i * angle_range / num_points
             point = Point()
