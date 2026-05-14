@@ -6,7 +6,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile
 
-from geometry_msgs.msg import Twist, Pose
+from geometry_msgs.msg import TwistStamped, Pose
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from tf_transformations import euler_from_quaternion
@@ -14,16 +14,15 @@ from tf_transformations import euler_from_quaternion
 
 class ObstacleDetection(Node):
     def __init__(self):
-        
         super().__init__("obstacle_detection")
-        self.get_logger().info("JAG KÖR obstacle_detection_working.py")
+        self.get_logger().info("JAG KÖR DEL 2.3 MJUKARE VÄJNING MED VIKTNING")
 
         # -----------------------------
         # Parametrar
         # -----------------------------
-        self.declare_parameter("stop_distance", 0.45)
+        self.declare_parameter("stop_distance", 0.30)
         self.declare_parameter("goal_x", 2.0)
-        self.declare_parameter("goal_y", 1.0)
+        self.declare_parameter("goal_y", 0.0)
 
         self.stop_distance = (
             self.get_parameter("stop_distance")
@@ -43,25 +42,18 @@ class ObstacleDetection(Node):
             .double_value
         )
 
-        self.get_logger().info(f"Using stop_distance: {self.stop_distance} m")
+        self.get_logger().info(f"Using stop_distance: {self.stop_distance}")
         self.get_logger().info(f"Goal: x={self.goal_x}, y={self.goal_y}")
 
         # -----------------------------
-        # Robotens tillstånd
+        # Robot state
         # -----------------------------
         self.pose = Pose()
         self.yaw = 0.0
-
-        # False = mål anges i /odom-koordinater
-        # True = mål anges i Gazebo world-koordinater med spawn offset
-        self.use_spawn_offset = False
-        self.spawn_x = -1.5
-        self.spawn_y = -0.5
-
-        self.goal_reached = False
+        self.has_odom_received = False
 
         # -----------------------------
-        # LaserScan-data
+        # Laser state
         # -----------------------------
         self.scan_ranges = []
         self.angle_min = 0.0
@@ -71,20 +63,15 @@ class ObstacleDetection(Node):
         self.has_scan_received = False
 
         # -----------------------------
-        # State machine
+        # Control state
         # -----------------------------
-        self.mode = "GO_TO_GOAL"
-        self.avoid_direction = 0.0
-        self.avoid_target_yaw = 0.0
-        self.avoid_turn_start = None
-        self.avoid_forward_start = None
+        self.goal_reached = False
+        self.avoid_direction = 1.0
+        self.last_avoid_direction = 1.0
 
-        # -----------------------------
-        # Publisher / Subscribers
-        # -----------------------------
         qos = QoSProfile(depth=10)
 
-        self.cmd_vel_pub = self.create_publisher(Twist, "cmd_vel", qos)
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, "cmd_vel", qos)
 
         self.odom_sub = self.create_subscription(
             Odometry,
@@ -117,6 +104,7 @@ class ObstacleDetection(Node):
 
         roll, pitch, yaw = euler_from_quaternion(q)
         self.yaw = yaw
+        self.has_odom_received = True
 
     # --------------------------------------------------
     # LaserScan
@@ -133,7 +121,7 @@ class ObstacleDetection(Node):
     # Timer
     # --------------------------------------------------
     def timer_callback(self):
-        if self.has_scan_received:
+        if self.has_scan_received and self.has_odom_received:
             self.control_robot()
 
     # --------------------------------------------------
@@ -143,27 +131,21 @@ class ObstacleDetection(Node):
         return math.atan2(math.sin(angle), math.cos(angle))
 
     def stop_robot(self):
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
-        self.cmd_vel_pub.publish(twist)
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
 
-    def get_robot_position(self):
-        if self.use_spawn_offset:
-            robot_x = self.pose.position.x + self.spawn_x
-            robot_y = self.pose.position.y + self.spawn_y
-        else:
-            robot_x = self.pose.position.x
-            robot_y = self.pose.position.y
+        msg.twist.linear.x = 0.0
+        msg.twist.angular.z = 0.0
 
-        return robot_x, robot_y
+        self.cmd_vel_pub.publish(msg)
 
     # --------------------------------------------------
     # Hitta närmaste hinder framför roboten
     # --------------------------------------------------
     def get_front_obstacle(self):
         closest_distance = float("inf")
-        closest_angle = 0.0
+        #closest_angle = 0.0
 
         for i, r in enumerate(self.scan_ranges):
             if math.isinf(r) or math.isnan(r):
@@ -175,8 +157,9 @@ class ObstacleDetection(Node):
             angle = self.angle_min + i * self.angle_increment
             angle = self.normalize_angle(angle)
 
-            # Framför roboten: ungefär -45 till +45 grader
-            if -0.55 <= angle <= 0.55:
+            # Framför roboten: ungefär +-45 grader
+            # Viktigt: normalisering gör att höger sida inte blir blind.
+            if -1.2 <= angle <= 1.2:
                 if r < closest_distance:
                     closest_distance = r
                     closest_angle = angle
@@ -185,6 +168,8 @@ class ObstacleDetection(Node):
 
     # --------------------------------------------------
     # Hitta närmaste hinder i en sektor
+        closest_angle = 0.0
+
     # --------------------------------------------------
     def get_sector_distance(self, min_angle, max_angle):
         closest_distance = float("inf")
@@ -208,18 +193,20 @@ class ObstacleDetection(Node):
     # --------------------------------------------------
     # Välj väjningsriktning
     # --------------------------------------------------
-    def choose_avoid_direction(self, closest_angle, goal_angle):
-        # Kolla vilken sida som är mest fri
-       if closest_angle > 0:
-           return -1.0
-       else:
-           return 1.0
+    def choose_avoid_direction(self, closest_angle):
+        if closest_angle > 0.15:
+            self.last_avoid_direction = -1.0   # hinder vänster → sväng höger
+        elif closest_angle < -0.15:
+            self.last_avoid_direction = 1.0    # hinder höger → sväng vänster
 
+        return self.last_avoid_direction
     # --------------------------------------------------
-    # Huvudlogik
+    # Huvudlogik: Del 2.3 viktad styrning
     # --------------------------------------------------
     def control_robot(self):
-        twist = Twist()
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
 
         if self.goal_reached:
             self.stop_robot()
@@ -228,7 +215,8 @@ class ObstacleDetection(Node):
         # -----------------------------
         # Position och mål
         # -----------------------------
-        robot_x, robot_y = self.get_robot_position()
+        robot_x = self.pose.position.x
+        robot_y = self.pose.position.y
 
         dx = self.goal_x - robot_x
         dy = self.goal_y - robot_y
@@ -237,8 +225,16 @@ class ObstacleDetection(Node):
         goal_angle = math.atan2(dy, dx)
         e_theta_goal = self.normalize_angle(goal_angle - self.yaw)
 
-        # Lite större tolerans så roboten inte fastnar nära hinder vid målet
-        if distance_to_goal < 0.35:
+        self.get_logger().info(
+            f"DEBUG position: robot_x={robot_x:.2f}, robot_y={robot_y:.2f}, "
+            f"goal_x={self.goal_x:.2f}, goal_y={self.goal_y:.2f}, "
+            f"distance_to_goal={distance_to_goal:.2f}"
+        )
+
+        # -----------------------------
+        # Mål nått
+        # -----------------------------
+        if distance_to_goal < 0.25:
             self.goal_reached = True
             self.stop_robot()
             self.get_logger().info("Goal reached! Robot stopped.")
@@ -249,143 +245,79 @@ class ObstacleDetection(Node):
         # -----------------------------
         closest_distance, closest_angle = self.get_front_obstacle()
 
-        self.get_logger().info(
-            f"Mode: {self.mode}, Goal dist: {distance_to_goal:.2f}, "
-            f"Obstacle: {closest_distance:.2f}, angle: {closest_angle:.2f}"
-        )
+        # -----------------------------
+        # Del 2.3: viktning - viktigt börja tänka redan 
+        # -----------------------------
+        avoid_start_distance = self.stop_distance + 0.25
 
-        # ==================================================
-        # MODE 1: GO_TO_GOAL
-        # ==================================================
-        if self.mode == "GO_TO_GOAL":
-            if closest_distance < self.stop_distance:
-                self.avoid_direction = self.choose_avoid_direction(
-                    closest_angle,
-                    goal_angle,
-                )
-
-                # Sväng ungefär 60 grader, inte 90.
-                # Det gör att roboten inte vänder bort för mycket från målet.
-                self.avoid_target_yaw = self.normalize_angle(
-                    self.yaw + self.avoid_direction * math.pi / 3
-                )
-
-                self.mode = "AVOID_TURN"
-                self.avoid_turn_start = self.get_clock().now()
-
-                self.get_logger().info(
-                    f"Obstacle detected. Switch to AVOID_TURN. "
-                    f"Direction: {self.avoid_direction:.0f}"
-                )
-
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-                self.cmd_vel_pub.publish(twist)
-                return
-
-            # P-regulator mot mål
-            P = 0.8
-            max_angular_speed = 0.30
-
-            twist.angular.z = P * e_theta_goal
-            twist.angular.z = max(
-                min(twist.angular.z, max_angular_speed),
-                -max_angular_speed,
+        if closest_distance == float("inf"):
+            avoid_weight = 0.0
+        elif closest_distance <= self.stop_distance:
+            avoid_weight = 1.0
+        elif closest_distance >= avoid_start_distance:
+            avoid_weight = 0.0
+        else:
+            avoid_weight = (avoid_start_distance - closest_distance) / (
+                avoid_start_distance - self.stop_distance
             )
 
-            if abs(e_theta_goal) > 0.60:
-                twist.linear.x = 0.0
-            elif abs(e_theta_goal) > 0.25:
-                twist.linear.x = 0.05
+        goal_weight = 1.0 - avoid_weight
+
+        # -----------------------------
+        # Riktning bort från hinder
+        # -----------------------------
+        if avoid_weight > 0.0:
+            self.avoid_direction = self.choose_avoid_direction(closest_angle)
+
+            avoid_angle = self.normalize_angle(
+                self.yaw + self.avoid_direction * math.pi / 4
+            )
+
+            e_theta_avoid = self.normalize_angle(avoid_angle - self.yaw)
+        else:
+            e_theta_avoid = 0.0
+
+        # -----------------------------
+        # Kombinera mål och väjning
+        # -----------------------------
+        combined_error = (
+            goal_weight * e_theta_goal
+            + avoid_weight * e_theta_avoid
+        )
+
+        combined_error = self.normalize_angle(combined_error)
+
+        # -----------------------------
+        # P-regulator
+        # -----------------------------
+        P = 0.6
+        msg.twist.angular.z = P * combined_error
+        msg.twist.angular.z = max(min(msg.twist.angular.z, 0.35), -0.35)
+
+        # -----------------------------
+        # Framåthastighet
+        # -----------------------------
+        if abs(combined_error) > 0.85:
+            msg.twist.linear.x = 0.0
+        elif abs(combined_error) > 0.45:
+            msg.twist.linear.x = 0.04
+        else:
+            if avoid_weight > 0.6:
+                msg.twist.linear.x = 0.035
+            elif avoid_weight > 0.3:
+                msg.twist.linear.x = 0.06
             else:
-                twist.linear.x = 0.10
+                msg.twist.linear.x = 0.10
 
-            self.cmd_vel_pub.publish(twist)
-            return
+        self.get_logger().info(
+            f"2.3 weights: goal={goal_weight:.2f}, "
+            f"avoid={avoid_weight:.2f}, "
+            f"combined_error={combined_error:.2f}, "
+            f"obstacle={closest_distance:.2f}, "
+            f"goal_dist={distance_to_goal:.2f}"
+        )
 
-        # ==================================================
-        # MODE 2: AVOID_TURN
-        # ==================================================
-        if self.mode == "AVOID_TURN":
-            e_theta_avoid = self.normalize_angle(self.avoid_target_yaw - self.yaw)
-
-            twist.linear.x = 0.0
-            twist.angular.z = 0.8 * e_theta_avoid
-            twist.angular.z = max(min(twist.angular.z, 0.35), -0.35)
-
-            now = self.get_clock().now()
-            elapsed_turn = (now - self.avoid_turn_start).nanoseconds / 1e9
-
-            # Gå vidare om roboten nästan svängt klart eller om den svängt för länge
-            if abs(e_theta_avoid) < 0.15 or elapsed_turn > 2.0:
-                self.mode = "AVOID_FORWARD"
-                self.avoid_forward_start = self.get_clock().now()
-                twist.angular.z = 0.0
-
-                self.get_logger().info("Finished turn. Switch to AVOID_FORWARD.")
-
-            self.cmd_vel_pub.publish(twist)
-            return
-
-        # ==================================================
-        # MODE 3: AVOID_FORWARD
-        # ==================================================
-        if self.mode == "AVOID_FORWARD":
-            now = self.get_clock().now()
-            elapsed = (now - self.avoid_forward_start).nanoseconds / 1e9
-
-            # Kolla om det är fritt rakt framför
-            front_clearance = self.get_sector_distance(-0.35, 0.35)
-
-            if front_clearance < self.stop_distance + 0.15:
-                self.mode = "AVOID_TURN"
-                self.avoid_target_yaw = self.normalize_angle(
-                    self.yaw + self.avoid_direction * math.pi / 4
-                )
-                self.avoid_turn_start = self.get_clock().now()
-
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-
-                self.get_logger().info(
-                    f"Front still blocked: {front_clearance:.2f}. Turning more."
-                )
-
-                self.cmd_vel_pub.publish(twist)
-                return
-
-            # Kör försiktigt framåt förbi hindret
-            twist.linear.x = 0.035
-
-            # Styr lite tillbaka mot målet
-            twist.angular.z = 0.15 * e_theta_goal
-            twist.angular.z = max(min(twist.angular.z, 0.20), -0.20)
-
-            # Om något fortfarande är rakt framför: sväng lite mer
-            if closest_distance < self.stop_distance and abs(closest_angle) < 0.45:
-                self.mode = "AVOID_TURN"
-                self.avoid_target_yaw = self.normalize_angle(
-                    self.yaw + self.avoid_direction * math.pi / 4
-                )
-                self.avoid_turn_start = self.get_clock().now()
-
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-
-                self.get_logger().info("Still blocked. Turning more.")
-                self.cmd_vel_pub.publish(twist)
-                return
-
-            # Efter en kort stund: tillbaka till målet
-            if elapsed > 2.0:
-                self.mode = "GO_TO_GOAL"
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-
-                self.get_logger().info("Avoid forward done. Back to GO_TO_GOAL.")
-
-            self.cmd_vel_pub.publish(twist)
-            return
+        self.cmd_vel_pub.publish(msg)
 
     # --------------------------------------------------
     # Stoppa roboten vid avstängning
