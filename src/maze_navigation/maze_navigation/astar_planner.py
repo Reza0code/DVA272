@@ -1,13 +1,58 @@
+import os
+import yaml
+from PIL import Image
+
 import rclpy
 from rclpy.node import Node
+
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
+
 
 def heuristic(a, b):
     row_a, col_a = a
     row_b, col_b = b
 
     return abs(row_a - row_b) + abs(col_a - col_b)
+
+
+def load_map_from_yaml(yaml_path):
+    with open(yaml_path, "r") as file:
+        map_info = yaml.safe_load(file)
+
+    image_path = os.path.join(
+        os.path.dirname(yaml_path),
+        map_info["image"]
+    )
+
+    resolution = map_info["resolution"]
+    origin = map_info["origin"]
+
+    img = Image.open(image_path).convert("L")
+
+    grid = []
+
+    for y in range(img.height):
+        row = []
+
+        for x in range(img.width):
+            pixel = img.getpixel((x, y))
+
+            # PGM-map:
+            # svart = hinder
+            # vitt = fri yta
+            # grå = okänd yta
+            if pixel < 50:
+                row.append(1)      # hinder
+            elif pixel > 200:
+                row.append(0)      # fri yta
+            else:
+                row.append(1)      # okänd behandlas som hinder
+
+        grid.append(row)
+
+    return grid, resolution, origin
+
 
 def get_neighbors(grid, current):
     row, col = current
@@ -25,20 +70,20 @@ def get_neighbors(grid, current):
         new_row = row + d_row
         new_col = col + d_col
 
-        # Kontrollera att rutan är inne i kartan
         if new_row < 0 or new_row >= len(grid):
             continue
 
         if new_col < 0 or new_col >= len(grid[0]):
             continue
 
-        # Kontrollera att rutan inte är vägg
         if grid[new_row][new_col] == 1:
             continue
 
         neighbors.append((new_row, new_col))
 
     return neighbors
+
+
 def build_path(parent, start, goal):
     path = []
     current = goal
@@ -52,6 +97,7 @@ def build_path(parent, start, goal):
 
     return path
 
+
 def astar(grid, start, goal):
     open_list = [start]
     closed_list = []
@@ -63,13 +109,10 @@ def astar(grid, start, goal):
 
     while open_list:
         current = min(
-    open_list,
-    key=lambda node: g_score[node] + heuristic(node, goal)
-)
+            open_list,
+            key=lambda node: g_score[node] + heuristic(node, goal)
+        )
 
-        #print("Current:", current)
-        #print("f(current):", g_score[current] + heuristic(current, goal))
-        
         if current == goal:
             print("Goal reached!")
             return build_path(parent, start, goal)
@@ -77,50 +120,32 @@ def astar(grid, start, goal):
         open_list.remove(current)
         closed_list.append(current)
 
-        #print("open_list:", open_list)
-        #print("closed_list:", closed_list)
-
         neighbors = get_neighbors(grid, current)
-        #print("neighbors:", neighbors)
 
         for neighbor in neighbors:
             if neighbor in closed_list:
                 continue
 
+            tentative_g = g_score[current] + 1
+
             if neighbor not in open_list:
                 open_list.append(neighbor)
                 parent[neighbor] = current
-                g_score[neighbor] = g_score[current] + 1
+                g_score[neighbor] = tentative_g
 
-        #print("open_list after neighbors:", open_list)
-        #print("parent:", parent)
-        #print("g_score:", g_score)    
+            elif tentative_g < g_score[neighbor]:
+                parent[neighbor] = current
+                g_score[neighbor] = tentative_g
 
     return []
 
-def print_grid_with_path(grid, path, start, goal):
-    display = []
-
-    for row in grid:
-        display.append(row.copy())
-
-    for row, col in path:
-        display[row][col] = "*"
-
-    start_row, start_col = start
-    goal_row, goal_col = goal
-
-    display[start_row][start_col] = "S"
-    display[goal_row][goal_col] = "G"
-
-    for row in display:
-        print(" ".join(str(cell) for cell in row))
 
 def grid_to_world(row, col, resolution, origin_x, origin_y):
     x = origin_x + (col + 0.5) * resolution
     y = origin_y + (row + 0.5) * resolution
 
-    return (round(x, 3), round(y, 3))     
+    return (round(x, 3), round(y, 3))
+
 
 def create_path_msg(world_path):
     path_msg = Path()
@@ -138,44 +163,75 @@ def create_path_msg(world_path):
 
         path_msg.poses.append(pose)
 
-    return path_msg   
+    return path_msg
+
+
+def is_free(grid, point):
+    row, col = point
+
+    if row < 0 or row >= len(grid):
+        return False
+
+    if col < 0 or col >= len(grid[0]):
+        return False
+
+    return grid[row][col] == 0
+
 
 class AStarPlanner(Node):
     def __init__(self):
         super().__init__("astar_planner")
         self.get_logger().info("A* planner node started")
+
         self.path_pub = self.create_publisher(Path, "/planned_path", 10)
 
-        grid = [
-            [0, 0, 0, 1, 0, 0],
-            [1, 1, 0, 1, 0, 1],
-            [0, 0, 0, 0, 0, 1],
-            [0, 1, 1, 1, 0, 0],
-            [0, 0, 0, 0, 0, 0],
-        ]
+        yaml_path = "/home/rosdev/projek_ws/maps/first_map/map_1.yaml"
 
-        start = (0, 0)
-        goal = (4, 5)
+        grid, resolution, origin = load_map_from_yaml(yaml_path)
+
+        origin_x = origin[0]
+        origin_y = origin[1]
+
+        self.get_logger().info(
+            f"Loaded map: rows={len(grid)}, cols={len(grid[0])}, "
+            f"resolution={resolution}, origin=({origin_x}, {origin_y})"
+        )
+
+        # Tillfälliga testpunkter i grid-koordinater
+        # Vi kan ändra dessa om de hamnar i vägg/okänd yta
+        start = (20, 20)
+        goal = (45, 45)
+
+        if not is_free(grid, start):
+            self.get_logger().error(f"Start is not free: {start}")
+            return
+
+        if not is_free(grid, goal):
+            self.get_logger().error(f"Goal is not free: {goal}")
+            return
 
         path = astar(grid, start, goal)
 
         self.get_logger().info(f"Path found: {path}")
-        resolution = 0.5
-        origin_x = 0.0
-        origin_y = 0.0
+
+        if not path:
+            self.get_logger().error("No path found!")
+            return
 
         world_path = []
 
         for row, col in path:
             world_point = grid_to_world(row, col, resolution, origin_x, origin_y)
             world_path.append(world_point)
+
         self.get_logger().info(f"World path: {world_path}")
+
         path_msg = create_path_msg(world_path)
         self.path_pub.publish(path_msg)
+
         self.get_logger().info("Published path on /planned_path")
 
-    
-        
+
 def main(args=None):
     rclpy.init(args=args)
 
@@ -185,5 +241,7 @@ def main(args=None):
 
     node.destroy_node()
     rclpy.shutdown()
+
+
 if __name__ == "__main__":
     main()
