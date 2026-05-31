@@ -111,6 +111,7 @@ class PathFollower(Node):
             (target_pose.y - self.robot_y) ** 2
         )
         # Om vi är nära sista målet: stoppa och avsluta
+        # Stop if final goal is close enough
         if self.target_index == len(self.path) - 1 and distance < 0.50:
             self.publish_stop()
 
@@ -119,27 +120,14 @@ class PathFollower(Node):
                 self.goal_logged = True
 
             return
+
         # Safety stop if obstacle is too close in front
-        if self.front_distance < 0.20:
-            twist = Twist()
-            twist.linear.x = -0.03
-            twist.angular.z = 0.4
-            self.cmd_pub.publish(twist)
-
-            self.get_logger().warn(
-                f"Obstacle very close! front={self.front_distance:.2f}. Backing and turning."
-            )
-            return
-
         if self.front_distance < 0.30:
-            twist = Twist()
-            twist.linear.x = 0.0
-            twist.angular.z = 0.25
-            self.cmd_pub.publish(twist)
+            self.publish_stop()
 
             self.get_logger().warn(
-                f"Obstacle close! front={self.front_distance:.2f}. Turning."
-            )       
+                f"path blocked by obstacle! front={self.front_distance:.2f}. Robot stopped before goal."
+            )
             return
 
         # Stop only when the robot is actually close to the final goal
