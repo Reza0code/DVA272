@@ -12,7 +12,6 @@ from sensor_msgs.msg import LaserScan
 def yaw_from_quaternion(q):
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-
     return math.atan2(siny_cosp, cosy_cosp)
 
 
@@ -20,7 +19,7 @@ class PathFollower(Node):
     def __init__(self):
         super().__init__("path_follower")
         self.get_logger().info(
-            "Path follower started: A* + corridor + obstacle avoidance"
+            "Path follower started: strict A* path + safe corridor navigation"
         )
 
         self.cmd_pub = self.create_publisher(TwistStamped, "/cmd_vel", 10)
@@ -30,11 +29,11 @@ class PathFollower(Node):
         self.target_index = 0
         self.goal_logged = False
 
-        # Robot state
+        # Robot state from AMCL/map
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_yaw = 0.0
-        self.has_odom = False
+        self.has_pose = False
 
         # Laser state
         self.scan_ranges = []
@@ -92,6 +91,7 @@ class PathFollower(Node):
             self.get_logger().info(
                 f"Last point: x={last_pose.x:.3f}, y={last_pose.y:.3f}"
             )
+
     def scan_callback(self, msg):
         self.scan_ranges = msg.ranges
         self.angle_min = msg.angle_min
@@ -99,11 +99,12 @@ class PathFollower(Node):
         self.range_min = msg.range_min
         self.range_max = msg.range_max
         self.has_scan = True
+
     def amcl_callback(self, msg):
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
         self.robot_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
-        self.has_odom = True
+        self.has_pose = True
 
     def normalize_angle(self, angle):
         return math.atan2(math.sin(angle), math.cos(angle))
@@ -128,8 +129,7 @@ class PathFollower(Node):
             angle = self.normalize_angle(angle)
 
             if min_angle <= angle <= max_angle:
-                if r < closest_distance:
-                    closest_distance = r
+                closest_distance = min(closest_distance, r)
 
         return closest_distance
 
@@ -153,6 +153,7 @@ class PathFollower(Node):
             f"{mode} | v={msg.twist.linear.x:.3f}, "
             f"w={msg.twist.angular.z:.3f} {extra_info}"
         )
+
     def update_target_index(self):
         if not self.path:
             return
@@ -160,7 +161,7 @@ class PathFollower(Node):
         closest_index = self.target_index
         closest_distance = float("inf")
 
-    # Leta bara framåt i pathen, inte bakåt
+        # Leta bara framåt i pathen, inte bakåt
         for i in range(self.target_index, len(self.path)):
             p = self.path[i].pose.position
 
@@ -173,8 +174,9 @@ class PathFollower(Node):
                 closest_distance = d
                 closest_index = i
 
-        # Hoppa några punkter framåt så roboten inte jagar en punkt under sig/bakom sig
-        lookahead = 5
+        # Viktigt i trång labyrint:
+        # lookahead får inte vara för stort, annars skär roboten hörn.
+        lookahead = 2
         new_index = min(closest_index + lookahead, len(self.path) - 1)
 
         if new_index > self.target_index:
@@ -184,8 +186,9 @@ class PathFollower(Node):
         if not self.path:
             return
 
-        if not self.has_odom or not self.has_scan:
+        if not self.has_pose or not self.has_scan:
             return
+
         self.update_target_index()
 
         target_pose = self.path[self.target_index].pose.position
@@ -208,7 +211,7 @@ class PathFollower(Node):
             return
 
         # Move to next target point
-        if distance < 0.25 and self.target_index < len(self.path) - 1:
+        if distance < 0.22 and self.target_index < len(self.path) - 1:
             self.target_index += 1
             self.get_logger().info(
                 f"Moving to next target index: {self.target_index}"
@@ -226,24 +229,39 @@ class PathFollower(Node):
         self.left_distance = left
         self.right_distance = right
 
-        # Distances tuned for narrow corridor
+        # Tuned for narrow maze
         danger_distance = 0.13
         front_distance = 0.25
         side_distance = 0.20
         corner_distance = 0.15
 
-        # 0. Corner / stuck escape
+        # 0. If path requires a big turn and wall is close ahead:
+        # Rotate toward path first. Do not drive into the corner.
+        if front < 0.35 and abs(angle_error) > 0.70:
+            angular = 0.32 if angle_error > 0 else -0.32
+            msg = self.make_twist(0.0, angular)
+
+            self.publish_cmd(
+                msg,
+                "TURN TO PATH BEFORE MOVING",
+                f"| index={self.target_index}, front={front:.2f}, "
+                f"e_path={angle_error:.2f}, left={left:.2f}, right={right:.2f}"
+            )
+            return
+
+        # 1. Corner / stuck escape
         if front < corner_distance and (left < corner_distance or right < corner_distance):
             if left > right:
-                angular = 0.45
+                angular = 0.35
                 self.last_turn_direction = 1.0
             elif right > left:
-                angular = -0.45
+                angular = -0.35
                 self.last_turn_direction = -1.0
             else:
-                angular = 0.45 * self.last_turn_direction
+                angular = 0.35 * self.last_turn_direction
 
-            msg = self.make_twist(-0.025, angular)
+            # Back very slowly only in real corner/stuck situation
+            msg = self.make_twist(-0.015, angular)
 
             self.publish_cmd(
                 msg,
@@ -252,91 +270,116 @@ class PathFollower(Node):
             )
             return
 
-        # 1. Danger directly in front
+        # 2. Danger directly in front
         if front < danger_distance:
-            if left > right:
-                angular = 0.42
+            # Still use path direction if possible
+            if abs(angle_error) > 0.25:
+                angular = 0.35 if angle_error > 0 else -0.35
+            elif left > right:
+                angular = 0.35
                 self.last_turn_direction = 1.0
             elif right > left:
-                angular = -0.42
+                angular = -0.35
                 self.last_turn_direction = -1.0
             else:
-                angular = 0.42 * self.last_turn_direction
+                angular = 0.35 * self.last_turn_direction
 
             msg = self.make_twist(0.0, angular)
 
             self.publish_cmd(
                 msg,
-                "DANGER FRONT",
-                f"| front={front:.2f}, left={left:.2f}, right={right:.2f}"
+                "DANGER FRONT + PATH",
+                f"| front={front:.2f}, left={left:.2f}, right={right:.2f}, "
+                f"e_path={angle_error:.2f}"
             )
             return
 
-        # 2. Obstacle ahead, but not emergency
+        # 3. Obstacle ahead, but not emergency:
+        # Blend obstacle avoidance with path direction.
         if front < front_distance:
-            if front_left > front_right:
-                angular = 0.32
-                self.last_turn_direction = 1.0
-            elif front_right > front_left:
-                angular = -0.32
-                self.last_turn_direction = -1.0
+            angular = 0.9 * angle_error
+            angular = max(min(angular, 0.30), -0.30)
+
+            if abs(angle_error) > 0.35:
+                linear = 0.0
             else:
-                angular = 0.32 * self.last_turn_direction
+                linear = 0.008
+
+            msg = self.make_twist(linear, angular)
+
+            self.publish_cmd(
+                msg,
+                "SLOW PATH FOLLOW NEAR FRONT",
+                f"| front={front:.2f}, e_path={angle_error:.2f}"
+            )
+            return
+
+        # 4. Too close to left wall.
+        # But if path strongly says left, do not fight it too hard.
+        if left < side_distance:
+            wall_angular = -0.22
+            path_angular = 0.55 * angle_error
+            angular = 0.65 * wall_angular + 0.35 * path_angular
+            angular = max(min(angular, 0.30), -0.30)
 
             msg = self.make_twist(0.020, angular)
 
             self.publish_cmd(
                 msg,
-                "AVOID FRONT",
-                f"| front={front:.2f}, front_left={front_left:.2f}, "
-                f"front_right={front_right:.2f}"
+                "TOO CLOSE LEFT + PATH",
+                f"| left={left:.2f}, right={right:.2f}, e_path={angle_error:.2f}"
             )
             return
 
-        # 3. Too close to left wall
-        if left < side_distance:
-            msg = self.make_twist(0.035, -0.25)
-
-            self.publish_cmd(
-                msg,
-                "TOO CLOSE LEFT",
-                f"| left={left:.2f}, right={right:.2f}"
-            )
-            return
-
-        # 4. Too close to right wall
+        # 5. Too close to right wall.
+        # But if path strongly says right, do not fight it too hard.
         if right < side_distance:
-            msg = self.make_twist(0.035, 0.25)
+            wall_angular = 0.22
+            path_angular = 0.55 * angle_error
+            angular = 0.65 * wall_angular + 0.35 * path_angular
+            angular = max(min(angular, 0.30), -0.30)
+
+            msg = self.make_twist(0.020, angular)
 
             self.publish_cmd(
                 msg,
-                "TOO CLOSE RIGHT",
-                f"| left={left:.2f}, right={right:.2f}"
+                "TOO CLOSE RIGHT + PATH",
+                f"| left={left:.2f}, right={right:.2f}, e_path={angle_error:.2f}"
             )
             return
 
-        # 5. Corridor mode
+        # 6. Corridor mode
         in_corridor = left < 1.0 and right < 1.0
 
         if in_corridor:
             wall_error = left - right
 
-            
-            wall_correction = 0.15 * wall_error
+            # Wall correction keeps robot away from walls,
+            # but A* path is still the main guide.
+            wall_correction = 0.16 * wall_error
             wall_correction = max(min(wall_correction, 0.10), -0.10)
-            
-            if abs(angle_error) > 0.80:
-                wall_correction = 0.0
-            p_goal = 0.85
-            angular = p_goal * angle_error + wall_correction
-            angular = max(min(angular, 0.35), -0.35)
 
+            # If robot is far from path direction, ignore wall correction.
+            if abs(angle_error) > 0.75:
+                wall_correction = 0.0
+
+            p_goal = 0.95
+            angular = p_goal * angle_error + wall_correction
+            angular = max(min(angular, 0.32), -0.32)
+
+            # Important: during large turns, rotate first.
             if abs(angle_error) > 0.90:
-                linear = 0.020
-            elif abs(angle_error) > 0.45:
-                linear = 0.040
+                linear = 0.0
+            elif abs(angle_error) > 0.60:
+                linear = 0.012
+            elif abs(angle_error) > 0.35:
+                linear = 0.025
             else:
-                linear = 0.060
+                linear = 0.045
+
+            # Extra safety if close to walls
+            if left < 0.28 or right < 0.28:
+                linear = min(linear, 0.020)
 
             msg = self.make_twist(linear, angular)
 
@@ -345,20 +388,22 @@ class PathFollower(Node):
                 "CORRIDOR",
                 f"| index={self.target_index}, dist={distance:.2f}, "
                 f"e_path={angle_error:.2f}, left={left:.2f}, right={right:.2f}, "
-                f"front={front:.2f}"
+                f"wall_corr={wall_correction:.2f}, front={front:.2f}"
             )
             return
 
-        # 6. Free path following
-        angular = 0.8 * angle_error
-        angular = max(min(angular, 0.40), -0.40)
+        # 7. Free path following
+        angular = 0.90 * angle_error
+        angular = max(min(angular, 0.35), -0.35)
 
-        if abs(angle_error) > 0.85:
+        if abs(angle_error) > 0.90:
             linear = 0.0
-        elif abs(angle_error) > 0.45:
+        elif abs(angle_error) > 0.55:
+            linear = 0.020
+        elif abs(angle_error) > 0.35:
             linear = 0.035
         else:
-            linear = 0.070
+            linear = 0.060
 
         msg = self.make_twist(linear, angular)
 
