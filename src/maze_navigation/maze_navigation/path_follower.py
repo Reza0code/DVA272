@@ -4,8 +4,8 @@ import math
 import rclpy
 from rclpy.node import Node
 
-from nav_msgs.msg import Path, Odometry
-from geometry_msgs.msg import Twist
+from nav_msgs.msg import Path
+from geometry_msgs.msg import TwistStamped, PoseWithCovarianceStamped
 from sensor_msgs.msg import LaserScan
 
 
@@ -19,19 +19,38 @@ def yaw_from_quaternion(q):
 class PathFollower(Node):
     def __init__(self):
         super().__init__("path_follower")
-        self.get_logger().info("Path follower node started")
+        self.get_logger().info(
+            "Path follower started: A* + corridor + obstacle avoidance"
+        )
 
-        self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.cmd_pub = self.create_publisher(TwistStamped, "/cmd_vel", 10)
 
+        # Path state
         self.path = []
         self.target_index = 0
+        self.goal_logged = False
 
+        # Robot state
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_yaw = 0.0
+        self.has_odom = False
 
+        # Laser state
+        self.scan_ranges = []
+        self.angle_min = 0.0
+        self.angle_increment = 0.0
+        self.range_min = 0.0
+        self.range_max = 3.5
+        self.has_scan = False
+
+        # Distances
         self.front_distance = float("inf")
-        self.goal_logged = False
+        self.left_distance = float("inf")
+        self.right_distance = float("inf")
+
+        # Avoidance memory
+        self.last_turn_direction = 1.0
 
         self.path_sub = self.create_subscription(
             Path,
@@ -40,10 +59,10 @@ class PathFollower(Node):
             10
         )
 
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            "/odom",
-            self.odom_callback,
+        self.amcl_sub = self.create_subscription(
+            PoseWithCovarianceStamped,
+            "/amcl_pose",
+            self.amcl_callback,
             10
         )
 
@@ -68,52 +87,118 @@ class PathFollower(Node):
             last_pose = self.path[-1].pose.position
 
             self.get_logger().info(
-                f"First point: x={first_pose.x}, y={first_pose.y}"
+                f"First point: x={first_pose.x:.3f}, y={first_pose.y:.3f}"
             )
             self.get_logger().info(
-                f"Last point: x={last_pose.x}, y={last_pose.y}"
+                f"Last point: x={last_pose.x:.3f}, y={last_pose.y:.3f}"
             )
-
-    def odom_callback(self, msg):
+    def scan_callback(self, msg):
+        self.scan_ranges = msg.ranges
+        self.angle_min = msg.angle_min
+        self.angle_increment = msg.angle_increment
+        self.range_min = msg.range_min
+        self.range_max = msg.range_max
+        self.has_scan = True
+    def amcl_callback(self, msg):
         self.robot_x = msg.pose.pose.position.x
         self.robot_y = msg.pose.pose.position.y
         self.robot_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
+        self.has_odom = True
 
-    def scan_callback(self, msg):
-        front_ranges = []
+    def normalize_angle(self, angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
 
-        for i, r in enumerate(msg.ranges):
-            angle = msg.angle_min + i * msg.angle_increment
+    def valid_range(self, r):
+        if math.isinf(r) or math.isnan(r):
+            return False
 
-        # Framåt ungefär +/- 25 grader
-            if -0.45 <= angle <= 0.45:
-                if math.isfinite(r):
-                    front_ranges.append(r)
+        if r < self.range_min or r > self.range_max:
+            return False
 
-        if front_ranges:
-            self.front_distance = min(front_ranges)
-        else:
-            self.front_distance = float("inf")
+        return True
+
+    def get_sector_distance(self, min_angle, max_angle):
+        closest_distance = float("inf")
+
+        for i, r in enumerate(self.scan_ranges):
+            if not self.valid_range(r):
+                continue
+
+            angle = self.angle_min + i * self.angle_increment
+            angle = self.normalize_angle(angle)
+
+            if min_angle <= angle <= max_angle:
+                if r < closest_distance:
+                    closest_distance = r
+
+        return closest_distance
+
+    def make_twist(self, linear_x=0.0, angular_z=0.0):
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
+
+        msg.twist.linear.x = linear_x
+        msg.twist.angular.z = angular_z
+
+        return msg
 
     def publish_stop(self):
-        stop_twist = Twist()
-        stop_twist.linear.x = 0.0
-        stop_twist.angular.z = 0.0
-        self.cmd_pub.publish(stop_twist)
+        self.cmd_pub.publish(self.make_twist(0.0, 0.0))
+
+    def publish_cmd(self, msg, mode, extra_info=""):
+        self.cmd_pub.publish(msg)
+
+        self.get_logger().info(
+            f"{mode} | v={msg.twist.linear.x:.3f}, "
+            f"w={msg.twist.angular.z:.3f} {extra_info}"
+        )
+    def update_target_index(self):
+        if not self.path:
+            return
+
+        closest_index = self.target_index
+        closest_distance = float("inf")
+
+    # Leta bara framåt i pathen, inte bakåt
+        for i in range(self.target_index, len(self.path)):
+            p = self.path[i].pose.position
+
+            d = math.sqrt(
+                (p.x - self.robot_x) ** 2 +
+                (p.y - self.robot_y) ** 2
+            )
+
+            if d < closest_distance:
+                closest_distance = d
+                closest_index = i
+
+        # Hoppa några punkter framåt så roboten inte jagar en punkt under sig/bakom sig
+        lookahead = 5
+        new_index = min(closest_index + lookahead, len(self.path) - 1)
+
+        if new_index > self.target_index:
+            self.target_index = new_index
 
     def control_loop(self):
         if not self.path:
             return
 
+        if not self.has_odom or not self.has_scan:
+            return
+        self.update_target_index()
+
         target_pose = self.path[self.target_index].pose.position
 
-        distance = math.sqrt(
-            (target_pose.x - self.robot_x) ** 2 +
-            (target_pose.y - self.robot_y) ** 2
-        )
-        # Om vi är nära sista målet: stoppa och avsluta
-        # Stop if final goal is close enough
-        if self.target_index == len(self.path) - 1 and distance < 0.50:
+        dx = target_pose.x - self.robot_x
+        dy = target_pose.y - self.robot_y
+
+        distance = math.sqrt(dx**2 + dy**2)
+        target_angle = math.atan2(dy, dx)
+        angle_error = self.normalize_angle(target_angle - self.robot_yaw)
+
+        # Final goal reached
+        if self.target_index == len(self.path) - 1 and distance < 0.20:
             self.publish_stop()
 
             if not self.goal_logged:
@@ -122,26 +207,7 @@ class PathFollower(Node):
 
             return
 
-        # Safety stop if obstacle is too close in front
-        if self.front_distance < 0.30:
-            self.publish_stop()
-
-            self.get_logger().warn(
-                f"path blocked by obstacle! front={self.front_distance:.2f}. Robot stopped before goal."
-            )
-            return
-
-        # Stop only when the robot is actually close to the final goal
-        if self.target_index == len(self.path) - 1 and distance < 0.25:
-            self.publish_stop()
-
-            if not self.goal_logged:
-                self.get_logger().info("Final goal reached. Stopping robot.")
-                self.goal_logged = True
-
-            return
-
-        # Move to next target point when close enough
+        # Move to next target point
         if distance < 0.25 and self.target_index < len(self.path) - 1:
             self.target_index += 1
             self.get_logger().info(
@@ -149,31 +215,171 @@ class PathFollower(Node):
             )
             return
 
-        target_angle = math.atan2(
-            target_pose.y - self.robot_y,
-            target_pose.x - self.robot_x
-        )
+        # LIDAR sectors
+        front = self.get_sector_distance(-0.45, 0.45)
+        front_left = self.get_sector_distance(0.15, 0.85)
+        front_right = self.get_sector_distance(-0.85, -0.15)
+        left = self.get_sector_distance(0.65, 1.40)
+        right = self.get_sector_distance(-1.40, -0.65)
 
-        angle_error = target_angle - self.robot_yaw
-        angle_error = math.atan2(math.sin(angle_error), math.cos(angle_error))
+        self.front_distance = front
+        self.left_distance = left
+        self.right_distance = right
 
-        self.get_logger().info(
-            f"index={self.target_index}, "
-            f"distance={distance:.3f}, "
-            f"angle_error={angle_error:.3f}, "
-            f"front={self.front_distance:.2f}"
-        )
+        # Distances tuned for narrow corridor
+        danger_distance = 0.13
+        front_distance = 0.25
+        side_distance = 0.20
+        corner_distance = 0.15
 
-        twist = Twist()
+        # 0. Corner / stuck escape
+        if front < corner_distance and (left < corner_distance or right < corner_distance):
+            if left > right:
+                angular = 0.45
+                self.last_turn_direction = 1.0
+            elif right > left:
+                angular = -0.45
+                self.last_turn_direction = -1.0
+            else:
+                angular = 0.45 * self.last_turn_direction
 
-        if abs(angle_error) > 0.6:
-            twist.linear.x = 0.0
-            twist.angular.z = 0.6 * angle_error
+            msg = self.make_twist(-0.025, angular)
+
+            self.publish_cmd(
+                msg,
+                "CORNER ESCAPE",
+                f"| front={front:.2f}, left={left:.2f}, right={right:.2f}"
+            )
+            return
+
+        # 1. Danger directly in front
+        if front < danger_distance:
+            if left > right:
+                angular = 0.42
+                self.last_turn_direction = 1.0
+            elif right > left:
+                angular = -0.42
+                self.last_turn_direction = -1.0
+            else:
+                angular = 0.42 * self.last_turn_direction
+
+            msg = self.make_twist(0.0, angular)
+
+            self.publish_cmd(
+                msg,
+                "DANGER FRONT",
+                f"| front={front:.2f}, left={left:.2f}, right={right:.2f}"
+            )
+            return
+
+        # 2. Obstacle ahead, but not emergency
+        if front < front_distance:
+            if front_left > front_right:
+                angular = 0.32
+                self.last_turn_direction = 1.0
+            elif front_right > front_left:
+                angular = -0.32
+                self.last_turn_direction = -1.0
+            else:
+                angular = 0.32 * self.last_turn_direction
+
+            msg = self.make_twist(0.020, angular)
+
+            self.publish_cmd(
+                msg,
+                "AVOID FRONT",
+                f"| front={front:.2f}, front_left={front_left:.2f}, "
+                f"front_right={front_right:.2f}"
+            )
+            return
+
+        # 3. Too close to left wall
+        if left < side_distance:
+            msg = self.make_twist(0.035, -0.25)
+
+            self.publish_cmd(
+                msg,
+                "TOO CLOSE LEFT",
+                f"| left={left:.2f}, right={right:.2f}"
+            )
+            return
+
+        # 4. Too close to right wall
+        if right < side_distance:
+            msg = self.make_twist(0.035, 0.25)
+
+            self.publish_cmd(
+                msg,
+                "TOO CLOSE RIGHT",
+                f"| left={left:.2f}, right={right:.2f}"
+            )
+            return
+
+        # 5. Corridor mode
+        in_corridor = left < 1.0 and right < 1.0
+
+        if in_corridor:
+            wall_error = left - right
+
+            
+            wall_correction = 0.15 * wall_error
+            wall_correction = max(min(wall_correction, 0.10), -0.10)
+            
+            if abs(angle_error) > 0.80:
+                wall_correction = 0.0
+            p_goal = 0.85
+            angular = p_goal * angle_error + wall_correction
+            angular = max(min(angular, 0.35), -0.35)
+
+            if abs(angle_error) > 0.90:
+                linear = 0.020
+            elif abs(angle_error) > 0.45:
+                linear = 0.040
+            else:
+                linear = 0.060
+
+            msg = self.make_twist(linear, angular)
+
+            self.publish_cmd(
+                msg,
+                "CORRIDOR",
+                f"| index={self.target_index}, dist={distance:.2f}, "
+                f"e_path={angle_error:.2f}, left={left:.2f}, right={right:.2f}, "
+                f"front={front:.2f}"
+            )
+            return
+
+        # 6. Free path following
+        angular = 0.8 * angle_error
+        angular = max(min(angular, 0.40), -0.40)
+
+        if abs(angle_error) > 0.85:
+            linear = 0.0
+        elif abs(angle_error) > 0.45:
+            linear = 0.035
         else:
-            twist.linear.x = 0.06
-            twist.angular.z = 0.8 * angle_error
+            linear = 0.070
 
-        self.cmd_pub.publish(twist)
+        msg = self.make_twist(linear, angular)
+
+        self.publish_cmd(
+            msg,
+            "PATH",
+            f"| index={self.target_index}, dist={distance:.2f}, "
+            f"e_path={angle_error:.2f}, front={front:.2f}, "
+            f"left={left:.2f}, right={right:.2f}"
+        )
+
+    def destroy_node(self):
+        self.get_logger().info("Shutting down, stopping robot...")
+
+        try:
+            if rclpy.ok():
+                self.publish_stop()
+        except Exception:
+            pass
+
+        super().destroy_node()
 
 
 def main(args=None):
@@ -181,10 +387,18 @@ def main(args=None):
 
     node = PathFollower()
 
-    rclpy.spin(node)
-
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("KeyboardInterrupt caught.")
+        try:
+            node.publish_stop()
+        except Exception:
+            pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

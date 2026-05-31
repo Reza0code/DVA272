@@ -1,4 +1,5 @@
 import os
+from tracemalloc import start
 import yaml
 from PIL import Image
 
@@ -53,7 +54,43 @@ def load_map_from_yaml(yaml_path):
 
     return grid, resolution, origin
 
+def inflate_obstacles(grid, inflation_radius=3):
+    inflated = [row.copy() for row in grid]
 
+    rows = len(grid)
+    cols = len(grid[0])
+
+    for row in range(rows):
+        for col in range(cols):
+            if grid[row][col] == 1:
+                for dr in range(-inflation_radius, inflation_radius + 1):
+                    for dc in range(-inflation_radius, inflation_radius + 1):
+                        nr = row + dr
+                        nc = col + dc
+
+                        if 0 <= nr < rows and 0 <= nc < cols:
+                            inflated[nr][nc] = 1
+
+    return inflated
+
+def find_nearest_free(grid, point, max_radius=10):
+    start_row, start_col = point
+
+    if is_free(grid, point):
+        return point
+
+    for radius in range(1, max_radius + 1):
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                row = start_row + dr
+                col = start_col + dc
+
+                candidate = (row, col)
+
+                if is_free(grid, candidate):
+                    return candidate
+
+    return None
 def get_neighbors(grid, current):
     row, col = current
 
@@ -188,6 +225,7 @@ class AStarPlanner(Node):
         yaml_path = "/home/rosdev/projek_ws/maps/first_map/map_1.yaml"
 
         grid, resolution, origin = load_map_from_yaml(yaml_path)
+        grid = inflate_obstacles(grid, inflation_radius=2)
 
         origin_x = origin[0]
         origin_y = origin[1]
@@ -199,9 +237,22 @@ class AStarPlanner(Node):
 
         # Tillfälliga testpunkter i grid-koordinater
         # Vi kan ändra dessa om de hamnar i vägg/okänd yta
-        start = (20, 20)
-        goal = (45, 45)
+        start = (54, 23)
+        goal = (8, 32)
+        start = find_nearest_free(grid, start)
+        goal = find_nearest_free(grid, goal)
 
+        if start is None:
+            self.get_logger().error("No free start found after inflation!")
+        
+            return
+
+        if goal is None:
+            self.get_logger().error("No free goal found after inflation!")
+            return
+
+        self.get_logger().info(f"Adjusted start: {start}")
+        self.get_logger().info(f"Adjusted goal: {goal}")
         if not is_free(grid, start):
             self.get_logger().error(f"Start is not free: {start}")
             return
