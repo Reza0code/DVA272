@@ -1,3 +1,4 @@
+from rclpy.qos import qos_profile_sensor_data
 import math
 
 import rclpy
@@ -50,7 +51,7 @@ class PathFollower(Node):
             LaserScan,
             "/scan",
             self.scan_callback,
-            10
+            qos_profile_sensor_data
         )
 
         self.timer = self.create_timer(0.1, self.control_loop)
