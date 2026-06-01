@@ -151,6 +151,37 @@ def build_path(parent, start, goal):
 
     return path
 
+def clearance_cost(grid, point):
+    row, col = point
+
+    # Ju närmare hinder, desto dyrare blir cellen.
+    # Det gör att A* föredrar mitten av korridoren.
+    cost_by_radius = [
+        (1, 15.0),
+        (2, 7.0),
+        (3, 4.0),
+        (4, 2.0),
+    ]
+
+    rows = len(grid)
+    cols = len(grid[0])
+
+    for radius, cost in cost_by_radius:
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                nr = row + dr
+                nc = col + dc
+
+                if nr < 0 or nr >= rows:
+                    continue
+
+                if nc < 0 or nc >= cols:
+                    continue
+
+                if grid[nr][nc] == 1:
+                    return cost
+
+    return 0.0
 
 def astar(grid, start, goal):
     open_list = [start]
@@ -175,8 +206,7 @@ def astar(grid, start, goal):
             if neighbor in closed_set:
                 continue
 
-            tentative_g = g_score[current] + 1
-
+            tentative_g = g_score[current] + 1.0 + clearance_cost(grid, neighbor)
             if neighbor not in open_list:
                 open_list.append(neighbor)
                 parent[neighbor] = current
@@ -240,19 +270,19 @@ class AStarPlanner(Node):
         self.last_marker_msg = None
 
         # Publicera om path + marker varje sekund så RViz inte missar den
-        self.republish_timer = self.create_timer(1.0, self.republish_path)
+        #slf.republish_timer = self.create_timer(1.0, self.republish_path)
 
         # Karta 1
-        self.yaml_path = "/home/rosdev/projek_ws/maps/first_map/map_1_copy.yaml"
+        self.yaml_path = "/home/rosdev/projek_ws/maps/Samir-karta/map.yaml"
 
         # För karta 2 senare:
-        # self.yaml_path = "/home/rosdev/projek_ws/maps/second_map/map_2.yaml"
+       #self.yaml_path = "/home/rosdev/projek_ws/maps/first_map/map_2.yaml"
 
         self.grid, self.resolution, self.origin = load_map_from_yaml(self.yaml_path)
 
         # Börja med 0 i trång bana.
         # Om A* hittar path stabilt kan vi testa inflation_radius=1 senare.
-        self.grid = inflate_obstacles(self.grid, inflation_radius=0)
+        self.grid = inflate_obstacles(self.grid, inflation_radius=1)
 
         self.origin_x = self.origin[0]
         self.origin_y = self.origin[1]
@@ -396,6 +426,10 @@ class AStarPlanner(Node):
                 self.origin_y
             )
             world_path.append((x, y))
+            # Force path to start exactly at robot's current AMCL pose.
+        # This prevents the follower from turning hard toward a shifted grid start.
+        if world_path:
+            world_path[0] = (self.robot_x, self.robot_y)
 
         self.get_logger().info(
             f"Start world path: x={world_path[0][0]:.3f}, y={world_path[0][1]:.3f}"

@@ -4,7 +4,7 @@
   <name>maze_navigation</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="https://github.com/Reza0code/DVA272.git">rosdev</maintainer>
+  <maintainer email="rosdev@example.com">rosdev</maintainer>
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>

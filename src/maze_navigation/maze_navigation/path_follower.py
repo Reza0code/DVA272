@@ -6,6 +6,7 @@ from rclpy.node import Node
 
 from nav_msgs.msg import Path
 from geometry_msgs.msg import TwistStamped, PoseWithCovarianceStamped
+from sensor_msgs import msg
 from sensor_msgs.msg import LaserScan
 
 
@@ -26,7 +27,7 @@ class PathFollower(Node):
 
         # Path state
         self.path = []
-        self.target_index = 0
+        self.target_index = 1
         self.goal_logged = False
 
         # Robot state from AMCL/map
@@ -75,22 +76,41 @@ class PathFollower(Node):
         self.timer = self.create_timer(0.1, self.control_loop)
 
     def path_callback(self, msg):
+    # Ignore empty paths
+        if not msg.poses:
+            return
+
+    # If this is the same path as before, do not reset target_index.
+    # astar_planner republishes the same path, and resetting here
+    # makes the robot start over again and shake.
+        if self.path:
+            old_first = self.path[0].pose.position
+            old_last = self.path[-1].pose.position
+            new_first = msg.poses[0].pose.position
+            new_last = msg.poses[-1].pose.position
+
+            same_length = len(self.path) == len(msg.poses)
+            same_start = abs(old_first.x - new_first.x) < 0.001 and abs(old_first.y - new_first.y) < 0.001
+            same_goal = abs(old_last.x - new_last.x) < 0.001 and abs(old_last.y - new_last.y) < 0.001
+
+            if same_length and same_start and same_goal:
+                return
+
         self.path = msg.poses
         self.target_index = 0
         self.goal_logged = False
 
-        self.get_logger().info(f"Saved path with {len(self.path)} poses")
+        self.get_logger().info(f"Saved NEW path with {len(self.path)} poses")
 
-        if self.path:
-            first_pose = self.path[0].pose.position
-            last_pose = self.path[-1].pose.position
+        first_pose = self.path[0].pose.position
+        last_pose = self.path[-1].pose.position
 
-            self.get_logger().info(
-                f"First point: x={first_pose.x:.3f}, y={first_pose.y:.3f}"
-            )
-            self.get_logger().info(
-                f"Last point: x={last_pose.x:.3f}, y={last_pose.y:.3f}"
-            )
+        self.get_logger().info(
+        f"First point: x={first_pose.x:.3f}, y={first_pose.y:.3f}"
+        )
+        self.get_logger().info(
+            f"Last point: x={last_pose.x:.3f}, y={last_pose.y:.3f}"
+        )
 
     def scan_callback(self, msg):
         self.scan_ranges = msg.ranges
@@ -158,29 +178,21 @@ class PathFollower(Node):
         if not self.path:
             return
 
-        closest_index = self.target_index
-        closest_distance = float("inf")
-
-        # Leta bara framåt i pathen, inte bakåt
-        for i in range(self.target_index, len(self.path)):
-            p = self.path[i].pose.position
+    # Följ pathen strikt, punkt för punkt.
+    # Hoppa inte långt fram i pathen, eftersom det gör att roboten siktar mot mål
+    # eller mot en punkt på andra sidan väggen.
+        while self.target_index < len(self.path) - 1:
+            p = self.path[self.target_index].pose.position
 
             d = math.sqrt(
                 (p.x - self.robot_x) ** 2 +
                 (p.y - self.robot_y) ** 2
             )
 
-            if d < closest_distance:
-                closest_distance = d
-                closest_index = i
-
-        # Viktigt i trång labyrint:
-        # lookahead får inte vara för stort, annars skär roboten hörn.
-        lookahead = 2
-        new_index = min(closest_index + lookahead, len(self.path) - 1)
-
-        if new_index > self.target_index:
-            self.target_index = new_index
+            if d < 0.12:
+                self.target_index += 1
+            else:
+                break
 
     def control_loop(self):
         if not self.path:
@@ -211,7 +223,7 @@ class PathFollower(Node):
             return
 
         # Move to next target point
-        if distance < 0.22 and self.target_index < len(self.path) - 1:
+        if distance < 0.30 and self.target_index < len(self.path) - 1:
             self.target_index += 1
             self.get_logger().info(
                 f"Moving to next target index: {self.target_index}"
@@ -237,8 +249,8 @@ class PathFollower(Node):
 
         # 0. If path requires a big turn and wall is close ahead:
         # Rotate toward path first. Do not drive into the corner.
-        if front < 0.35 and abs(angle_error) > 0.70:
-            angular = 0.32 if angle_error > 0 else -0.32
+        if front < 0.22 and abs(angle_error) > 1.10:
+            angular = 0.22 if angle_error > 0 else -0.22
             msg = self.make_twist(0.0, angular)
 
             self.publish_cmd(
@@ -298,7 +310,7 @@ class PathFollower(Node):
         # Blend obstacle avoidance with path direction.
         if front < front_distance:
             angular = 0.9 * angle_error
-            angular = max(min(angular, 0.30), -0.30)
+            angular = max(min(angular, 0.20), -0.0)
 
             if abs(angle_error) > 0.35:
                 linear = 0.0
@@ -320,7 +332,7 @@ class PathFollower(Node):
             wall_angular = -0.22
             path_angular = 0.55 * angle_error
             angular = 0.65 * wall_angular + 0.35 * path_angular
-            angular = max(min(angular, 0.30), -0.30)
+            angular = max(min(angular, 0.20), -0.20)
 
             msg = self.make_twist(0.020, angular)
 
@@ -345,6 +357,50 @@ class PathFollower(Node):
                 msg,
                 "TOO CLOSE RIGHT + PATH",
                 f"| left={left:.2f}, right={right:.2f}, e_path={angle_error:.2f}"
+            )
+            return
+        # STRICT PATH FOLLOWING:
+        # Om det inte finns akut hinder framför roboten, följ nästa waypoint strikt.
+        # STRICT PATH FOLLOWING:
+# Följ nästa waypoint långsamt men fortsätt röra dig om det finns plats framåt.
+        # STRICT PATH FOLLOWING:
+# I trånga svängar ska roboten först rotera mot pathen,
+        # inte köra fram samtidigt och skära hörnet.
+        # STRICT PATH FOLLOWING:
+# Följ pathen långsamt. Vid sväng ska roboten inte stå helt stilla,
+# eftersom den då kan fastna i hörnet. Den ska krypa framåt lite.
+        if front > 0.12:
+            angular = 1.15 * angle_error
+            angular = max(min(angular, 0.32), -0.32)
+
+            if abs(angle_error) > 1.20:
+                # Mycket stor felvinkel: rotera nästan på plats
+                linear = 0.00
+            elif abs(angle_error) > 0.75:
+                # Stor sväng: kryp mycket långsamt medan den svänger
+                linear = 0.006
+            elif abs(angle_error) > 0.50:
+                # Medium sväng
+                linear = 0.015
+            elif abs(angle_error) > 0.25:
+                # Liten sväng
+                linear = 0.030
+            else:
+                # Bra riktning
+                linear = 0.055
+
+            # Om väggen är nära på sidan, kör extra långsamt
+            if left < 0.18 or right < 0.16:
+                linear = min(linear, 0.016)
+
+            msg = self.make_twist(linear, angular)
+
+            self.publish_cmd(
+                msg,
+                "STRICT PATH CREEP",
+                f"| index={self.target_index}, dist={distance:.2f}, "
+                f"e_path={angle_error:.2f}, front={front:.2f}, "
+                f"left={left:.2f}, right={right:.2f}"
             )
             return
 
